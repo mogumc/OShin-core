@@ -28,6 +28,7 @@ const (
 	PermFileRead  PermissionType = "file_read"  // 读取本地文件
 	PermFileWrite PermissionType = "file_write" // 写入本地文件
 	PermNetwork   PermissionType = "network"    // 访问网络
+	PermSystem    PermissionType = "system"     // 系统操作 (os包危险函数)
 )
 
 type PermissionRequest struct {
@@ -333,15 +334,57 @@ func (s *Sandbox) ExecuteWithSandbox(L *lua.LState, script string, _ time.Durati
 func CreateSecureEnvironment(config *SecurityConfig) *lua.LState {
 	L := lua.NewState(lua.Options{SkipOpenLibs: true})
 
-	// 仅加载安全的库
-	lua.OpenBase(L)      // 基础函数（print, pairs, ipairs 等）
+	// 加载安全的库
+	lua.OpenBase(L)      // 基础函数
 	lua.OpenTable(L)     // table 库
 	lua.OpenString(L)    // string 库
 	lua.OpenMath(L)      // math 库
 	lua.OpenCoroutine(L) // coroutine 库
+	lua.OpenOs(L)        // os 包
 
 	sandbox := NewSandbox(config)
+	// 对 os 包的危险函数进行权限沙箱封装
+	sandboxOsFunctions(L, sandbox)
 	sandbox.SetupSandbox(L)
 
 	return L
+}
+
+// sandboxOsFunctions 对 os 包的危险函数进行权限校验封装
+func sandboxOsFunctions(L *lua.LState, sandbox *Sandbox) {
+	osTable := L.GetGlobal("os").(*lua.LTable)
+
+	// 需要权限校验的危险 os 函数
+	dangerousFuncs := []string{"execute", "exit", "getenv", "remove", "rename", "tmpname"}
+
+	for _, funcName := range dangerousFuncs {
+		origFunc := osTable.RawGetString(funcName)
+		if origFunc.Type() != lua.LTFunction {
+			continue
+		}
+		origFn := origFunc.(*lua.LFunction)
+		name := funcName // 创建闭包副本
+
+		osTable.RawSetString(name, L.NewFunction(func(L *lua.LState) int {
+			// 检查 system 权限
+			if !sandbox.RequestPermission(PermissionRequest{
+				Type:        PermSystem,
+				Description: "系统操作: os." + name,
+				Details:     map[string]string{"function": name},
+			}) {
+				L.Push(lua.LNil)
+				L.Push(lua.LString("permission denied: system"))
+				return 2
+			}
+
+			// 调用原始函数
+			numArgs := L.GetTop()
+			L.Push(origFn)
+			for i := 1; i <= numArgs; i++ {
+				L.Push(L.Get(i))
+			}
+			L.Call(numArgs, -1)
+			return L.GetTop()
+		}))
+	}
 }
