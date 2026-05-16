@@ -22,12 +22,16 @@ test/
 
 脚本通过 `request_permission()` 主动请求权限，宿主程序通过回调决定是否允许：
 
-| 权限类型 | 说明 |
-|---|---|
-| `exec` | 执行外部程序 (Python/Node/Lua 等) |
-| `network` | 网络访问 (HTTP 请求) |
-| `file_read` | 读取本地文件 |
-| `file_write` | 写入本地文件 |
+| 权限类型 | 说明 | 管控函数 |
+|---|---|---|
+| `exec` | 执行外部程序 (Python/Node/Lua 等) | `execute_external()` |
+| `network` | 网络访问 (HTTP 请求) | `http_request()` |
+| `file_read` | 读取本地文件 | `read_file()` |
+| `file_write` | 写入本地文件 | `write_file()` |
+| `system` | 系统操作 (os包危险函数) | `os.execute()`, `os.exit()`, `os.getenv()`, `os.remove()`, `os.rename()`, `os.tmpname()` |
+
+**安全函数（无需权限）**：
+- `os.time()`, `os.date()`, `os.difftime()`, `os.clock()`, `os.setlocale()`
 
 ```lua
 -- 脚本中使用
@@ -36,6 +40,15 @@ if ok then
     local data = http_request("https://api.example.com/data")
     -- ...
 end
+
+-- 使用 os 包安全函数（无需权限）
+local now = os.time()
+
+-- 使用 os 包危险函数（需要 system 权限）
+local ok = request_permission("system", "执行系统命令")
+if ok then
+    os.execute("ls -la")
+end
 ```
 
 权限请求流程：
@@ -43,6 +56,12 @@ end
 2. 沙箱检查 **预授权白名单** → 若命中则直接放行
 3. 否则调用 **宿主程序回调** → 由宿主程序询问用户
 4. 无回调且未预授权 → 默认拒绝
+
+**静态检测（AST 解析）**：
+- 脚本加载前通过 AST 解析检测危险函数调用
+- 拒绝包含 `load()`, `dofile()`, `loadfile()`, `loadstring()` 等危险函数的脚本
+- 拒绝访问 `debug`, `io`, `package` 等危险全局变量
+- 拒绝通过 `_G["load"]` 或 `_G.load` 等方式绕过检测
 
 ## 调用方式
 
@@ -69,6 +88,7 @@ config.PermissionCallback = func(req plugin.PermissionRequest) bool {
 }
 config.PreAuthorized = map[plugin.PermissionType]bool{
     plugin.PermNetwork: true,  // 预授权网络权限
+    plugin.PermSystem:  true,  // 预授权系统权限
 }
 
 core := plugin.NewCoreWithConfig(config)
@@ -187,6 +207,8 @@ CLI 安全模型：
 - 脚本通过 `request_permission(type, description)` 主动请求权限
 - CLI 模式下默认拒绝所有敏感操作（无权限回调）
 - 脚本应在执行敏感操作前先调用 `request_permission()` 检查权限
+- 权限类型：`exec`, `network`, `file_read`, `file_write`, `system`
+- `system` 权限控制 os 包危险函数：`execute`, `exit`, `getenv`, `remove`, `rename`, `tmpname`
 
 ### 3. FFI 共享库 (Python/Node/C 等)
 
@@ -203,6 +225,21 @@ go build -buildmode=c-shared -o oshin.dll ./cmd/ffi/
 | `OShinSetPermissionCallback(callback)` | 注册权限回调 |
 | `OShinFreeString(str)` | 释放返回字符串 |
 | `OShinVersion()` | 版本号 |
+
+**配置 JSON 格式**：
+```json
+{
+  "timeout": 5000,
+  "max_memory_mb": 64,
+  "pre_authorized": ["network", "exec", "system"]
+}
+```
+
+**权限回调函数签名**：
+```c
+int callback(const char* perm_type, const char* description, const char* details_json);
+// 返回 1=允许, 0=拒绝
+```
 
 ## Python 绑定
 
@@ -225,8 +262,8 @@ r = oshin.execute_direct(
 # 路由模式
 r = oshin.execute_route(script, "action_name", params)
 
-# 预授权
-r = oshin.execute(script, params, pre_authorized=["network", "exec"])
+# 预授权（包括 system 权限）
+r = oshin.execute(script, params, pre_authorized=["network", "exec", "system"])
 ```
 
 运行示例：
@@ -245,13 +282,25 @@ python test/test_permission.py
 
 ## 内置 Lua 函数
 
-| 函数 | 说明 |
-|---|---|
-| `request_permission(type, desc)` | 请求权限 (返回 true/false) |
-| `http_request(url, method, body)` | HTTP 请求 |
-| `execute_external(program, code)` | 执行外部程序 |
-| `read_file(path)` | 读取文件 |
-| `write_file(path, content)` | 写入文件 |
-| `json_parse(str)` | JSON 解析 |
-| `json_stringify(val)` | JSON 序列化 |
-| `log(msg)` | 日志输出 |
+| 函数 | 权限要求 | 说明 |
+|---|---|---|
+| `request_permission(type, desc)` | 无 | 请求权限 (返回 true/false) |
+| `http_request(url, method, body)` | `network` | HTTP 请求 |
+| `execute_external(program, code)` | `exec` | 执行外部程序 |
+| `read_file(path)` | `file_read` | 读取文件 |
+| `write_file(path, content)` | `file_write` | 写入文件 |
+| `json_parse(str)` | 无 | JSON 解析 |
+| `json_stringify(val)` | 无 | JSON 序列化 |
+| `log(msg)` | 无 | 日志输出 |
+
+**os 包函数**：
+
+| 函数 | 权限要求 | 说明 |
+|---|---|---|
+| `os.time()`, `os.date()`, `os.difftime()`, `os.clock()`, `os.setlocale()` | 无 | 安全函数，可直接使用 |
+| `os.execute(cmd)` | `system` | 执行系统命令 |
+| `os.exit([code])` | `system` | 退出程序 |
+| `os.getenv(varname)` | `system` | 获取环境变量 |
+| `os.remove(filename)` | `system` | 删除文件 |
+| `os.rename(oldname, newname)` | `system` | 重命名文件 |
+| `os.tmpname()` | `system` | 生成临时文件名 |
